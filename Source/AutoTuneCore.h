@@ -1,10 +1,18 @@
 // AutoTuneCore.h
 // Motor de autotune sin dependencias (solo C++17 estándar).
-//   1) PitchDetector : YIN sobre audio diezmado (~16 kHz), mediana de 3 estimaciones
+//   1) PitchDetector : YIN sobre audio diezmado (~16 kHz), ventana corta y reciente
 //   2) Cuantización  : nota más cercana de la escala elegida, con histéresis
-//   3) PitchShifter  : dos cabezales de lectura sobre una línea de retardo, con la
-//                      ventana igual a un número PAR de periodos (estilo PSOLA), de
-//                      modo que los saltos de lectura caen siempre en fase.
+//   3) PitchShifter  : dos cabezales de lectura sobre una línea de retardo con ventana
+//                      de EXACTAMENTE 2 periodos (como PSOLA): los dos cabezales quedan
+//                      siempre a un periodo de distancia y suenan en fase.
+//
+// Notas de diseño (v2):
+//   - La ventana es continua (2 x periodo) con límite de variación: no hay saltos de
+//     tamaño al cruzar de nota, que era lo que producía los "ruidos raros".
+//   - El audio se retrasa unos ms (pre-retardo) para que la corrección calculada con la
+//     detección llegue justo cuando suena esa parte del audio (aplana el vibrato).
+//   - Sin voz, el cabezal vuelve rápido a la posición central (un solo cabezal activo):
+//     consonantes y respiración pasan sin peinado ni barridos.
 #pragma once
 
 #include <algorithm>
@@ -38,7 +46,7 @@ inline constexpr int kScaleMasks[kNumScales] = {
 };
 
 // ----------------------------------------------------------------------------
-// Detector de tono (YIN)
+// Detector de tono (YIN con ventana reciente)
 // ----------------------------------------------------------------------------
 class PitchDetector
 {
@@ -56,8 +64,8 @@ public:
 
         minTau_ = std::max (2, (int) std::floor (dsr_ / kFMax));
         maxTau_ = (int) std::ceil (dsr_ / kFMin) + 1;
-        window_ = 512;
-        hop_ = 128;
+        window_ = 384;                   // ~24 ms
+        hop_ = 64;                       // ~4 ms
 
         ring_.assign (4096, 0.0f);
         ringMask_ = (int) ring_.size() - 1;
@@ -102,7 +110,7 @@ public:
 private:
     static constexpr double kFMin = 70.0;
     static constexpr double kFMax = 1000.0;
-    static constexpr float  kThreshold = 0.25f;
+    static constexpr float  kThreshold = 0.22f;
 
     Result analyse()
     {
@@ -112,21 +120,23 @@ private:
         for (int i = 0; i < total; ++i)
             linear_[(size_t) i] = ring_[(size_t) ((widx_ - total + i) & ringMask_)];
 
+        const float* y = linear_.data();
+        const int base = total - window_;          // la ventana termina en la muestra más reciente
+
         // Puerta de energía
         double e = 0.0;
-        for (int i = total - window_; i < total; ++i)
-            e += (double) linear_[(size_t) i] * linear_[(size_t) i];
+        for (int i = base; i < total; ++i)
+            e += (double) y[i] * y[i];
         if (std::sqrt (e / window_) < 0.004)
             return r;
 
-        // Función de diferencia
-        const float* x = linear_.data();
+        // Función de diferencia sobre la ventana más reciente
         for (int tau = 1; tau <= maxTau_; ++tau)
         {
             float sum = 0.0f;
-            for (int j = 0; j < window_; ++j)
+            for (int i = base; i < total; ++i)
             {
-                const float diff = x[j] - x[j + tau];
+                const float diff = y[i] - y[i - tau];
                 sum += diff * diff;
             }
             d_[(size_t) tau] = sum;
@@ -170,12 +180,12 @@ private:
         if (f0 < kFMin || f0 > kFMax)
             return r;
 
-        // Mediana de las últimas 3 estimaciones (quita saltos de octava sueltos)
+        // Mediana de las últimas 3 estimaciones (quita saltos sueltos)
         hist_[histCount_ % 3] = f0;
         ++histCount_;
         if (histCount_ >= 3)
         {
-            float a = hist_[0], b = hist_[1], c = hist_[2];
+            const float a = hist_[0], b = hist_[1], c = hist_[2];
             f0 = std::max (std::min (a, b), std::min (std::max (a, b), c));
         }
 
@@ -186,7 +196,7 @@ private:
 
     int factor_ = 3;
     double dsr_ = 16000.0;
-    int minTau_ = 16, maxTau_ = 230, window_ = 512, hop_ = 128;
+    int minTau_ = 16, maxTau_ = 230, window_ = 384, hop_ = 64;
     std::vector<float> ring_, linear_, d_, cmnd_;
     int ringMask_ = 4095, widx_ = 0, hopCount_ = 0, accCount_ = 0;
     float acc_ = 0.0f;
@@ -195,18 +205,24 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// Cambio de tono (dos cabezales + ventana de N periodos, N par)
+// Cambio de tono: dos cabezales, ventana = 2 periodos (continua)
 // ----------------------------------------------------------------------------
 class PitchShifter
 {
 public:
+    static constexpr double kPreDelaySec = 0.009;     // alinea detección y audio
+    static constexpr double kNominalHeadSec = 0.0065; // retardo medio del cabezal
+
     void prepare (double sampleRate)
     {
         sr_ = sampleRate;
-        buf_.assign (32768, 0.0f);
+        buf_.assign (65536, 0.0f);
         mask_ = (int) buf_.size() - 1;
-        minWindow_ = 0.030 * sr_;
-        maxWindow_ = 8000.0;
+        preDelay_ = kPreDelaySec * sr_;
+        minWindow_ = 0.003 * sr_;          // ~330 Hz como mínimo de ventana
+        maxWindow_ = 0.032 * sr_;          // 2 periodos a ~62 Hz
+        windowSmooth_ = 1.0 - std::exp (-1.0 / (0.004 * sr_));
+        buildTable();
         reset();
     }
 
@@ -215,30 +231,27 @@ public:
         std::fill (buf_.begin(), buf_.end(), 0.0f);
         wpos_ = 0;
         phase_ = 0.5;
-        window_ = minWindow_;
+        window_ = 0.010 * sr_;
     }
 
     // ratio > 1 sube el tono. period = periodo de la voz en muestras.
-    // idle = true cuando no hay voz: el cabezal vuelve despacio al centro (latencia fija)
+    // idle = true cuando no hay voz: el cabezal vuelve al centro (un solo cabezal activo)
     float process (float x, double ratio, double period, bool idle)
     {
         buf_[(size_t) wpos_] = x;
 
-        // Ventana = número par de periodos, lo más cercana posible a minWindow_
-        double target = minWindow_;
-        if (period > 20.0 && period < maxWindow_ * 0.5)
-        {
-            const int k = 2 * std::max (1, (int) std::lround (minWindow_ / (2.0 * period)));
-            target = std::min (maxWindow_, k * period);
-        }
-        window_ += 0.002 * (target - window_);
+        // Ventana = 2 periodos, con variación limitada (sin saltos)
+        const double target = std::max (minWindow_, std::min (maxWindow_, 2.0 * period));
+        const double diff = target - window_;
+        const double limit = 0.001 * window_;
+        window_ += std::max (-limit, std::min (limit, windowSmooth_ * diff));
 
         phase_ += (1.0 - ratio) / window_;
         if (idle)
         {
-            const double step = 0.05 / window_;
-            const double diff = 0.5 - phase_;
-            phase_ += std::max (-step, std::min (step, diff));
+            const double step = 0.12 / window_;
+            const double d = 0.5 - phase_;
+            phase_ += std::max (-step, std::min (step, d));
         }
         phase_ -= std::floor (phase_);
 
@@ -248,31 +261,60 @@ public:
             double ph = phase_ + 0.5 * h;
             ph -= std::floor (ph);
             const double s = std::sin (3.14159265358979323846 * ph);
-            y += (float) (s * s) * read (ph * window_);
+            y += (float) (s * s) * read (preDelay_ + ph * window_);
         }
 
         wpos_ = (wpos_ + 1) & mask_;
         return y;
     }
 
-    double nominalLatency() const { return 0.5 * minWindow_; }
+    double nominalLatency() const { return preDelay_ + kNominalHeadSec * sr_; }
 
 private:
+    // Interpolación por sinc con ventana (8 puntos): conserva los agudos (la "s", la
+    // respiración) incluso con retardos fraccionarios. La lineal los apagaba y modulaba.
     float read (double delay) const
     {
         const double rpos = (double) wpos_ - delay;
         const double fl = std::floor (rpos);
-        const float frac = (float) (rpos - fl);
-        const int i0 = (int) fl;
-        const float a = buf_[(size_t) (i0 & mask_)];
-        const float b = buf_[(size_t) ((i0 + 1) & mask_)];
-        return a + frac * (b - a);
+        const int phaseIdx = std::min (kPhases, (int) ((rpos - fl) * kPhases + 0.5));
+        const int i0 = (int) fl - 3;
+        const float* w = &table_[(size_t) phaseIdx * kTaps];
+        float sum = 0.0f;
+        for (int t = 0; t < kTaps; ++t)
+            sum += w[t] * buf_[(size_t) ((i0 + t) & mask_)];
+        return sum;
     }
 
-    double sr_ = 44100.0, minWindow_ = 1323.0, maxWindow_ = 8000.0;
-    double phase_ = 0.5, window_ = 1323.0;
+    void buildTable()
+    {
+        const double pi = 3.14159265358979323846;
+        table_.assign ((size_t) (kPhases + 1) * kTaps, 0.0f);
+        for (int p = 0; p <= kPhases; ++p)
+        {
+            const double frac = (double) p / kPhases;
+            double row[kTaps], total = 0.0;
+            for (int t = 0; t < kTaps; ++t)
+            {
+                const double x = (double) t - 3.0 - frac;          // distancia a la posición de lectura
+                const double sinc = std::abs (x) < 1e-9 ? 1.0 : std::sin (pi * x) / (pi * x);
+                const double u = x / 4.0;                          // ventana Blackman-Harris en [-4, 4]
+                const double win = std::abs (u) >= 1.0 ? 0.0
+                    : 0.35875 + 0.48829 * std::cos (pi * u) + 0.14128 * std::cos (2.0 * pi * u) + 0.01168 * std::cos (3.0 * pi * u);
+                row[t] = sinc * win;
+                total += row[t];
+            }
+            for (int t = 0; t < kTaps; ++t)
+                table_[(size_t) p * kTaps + (size_t) t] = (float) (row[t] / total);
+        }
+    }
+
+    static constexpr int kTaps = 8, kPhases = 256;
+    std::vector<float> table_;
+    double sr_ = 44100.0, preDelay_ = 400.0, minWindow_ = 132.0, maxWindow_ = 1411.0, windowSmooth_ = 0.005;
+    double phase_ = 0.5, window_ = 441.0;
     std::vector<float> buf_;
-    int mask_ = 32767, wpos_ = 0;
+    int mask_ = 65535, wpos_ = 0;
 };
 
 // ----------------------------------------------------------------------------
@@ -302,6 +344,7 @@ public:
         corrTarget_ = 0.0;
         period_ = sr_ / 200.0;
         voiced_ = false;
+        voicedStreak_ = 0;
         unvoicedCount_ = 100;
         currentNote_ = -1;
         detectedHz_ = 0.0f;
@@ -325,7 +368,9 @@ public:
     void process (float* const* io, int numChannels, int numSamples)
     {
         const int nch = std::min (numChannels, channels_);
-        const double coeff = speedMs_ <= 0.5f ? 1.0 : 1.0 - std::exp (-1.0 / ((double) speedMs_ * 0.001 * sr_));
+        // Mínimo 2 ms de suavizado: evita escalones audibles aunque la velocidad sea 0
+        const double tauMs = std::max (2.0, (double) speedMs_);
+        const double coeff = 1.0 - std::exp (-1.0 / (tauMs * 0.001 * sr_));
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -339,7 +384,7 @@ public:
                 onDetection (r);
 
             corrSmoothed_ += coeff * (corrTarget_ - corrSmoothed_);
-            const double ratio = std::pow (2.0, corrSmoothed_ / 12.0);
+            const double ratio = std::exp2 (corrSmoothed_ / 12.0);
             const bool idle = ! voiced_;
 
             for (int c = 0; c < nch; ++c)
@@ -348,13 +393,23 @@ public:
     }
 
 private:
+    static constexpr double kMaxCorrectionSemitones = 3.5;
+
     void onDetection (const PitchDetector::Result& r)
     {
         if (r.voiced)
         {
             unvoicedCount_ = 0;
+            ++voicedStreak_;
+            period_ += 0.5 * ((sr_ / (double) r.f0) - period_);   // periodo suavizado
+            if (voicedStreak_ == 1)
+                period_ = sr_ / (double) r.f0;
+
+            // Hace falta que la voz se confirme en 2 estimaciones seguidas
+            if (voicedStreak_ < 2)
+                return;
+
             voiced_ = true;
-            period_ = sr_ / (double) r.f0;
             detectedHz_ = r.f0;
 
             const double m = 69.0 + 12.0 * std::log2 ((double) r.f0 / 440.0);
@@ -366,11 +421,13 @@ private:
                 currentNote_ = best;
 
             targetNote_ = currentNote_;
-            corrTarget_ = ((double) currentNote_ - m) * (double) amount_;
+            const double corr = ((double) currentNote_ - m) * (double) amount_;
+            corrTarget_ = std::max (-kMaxCorrectionSemitones, std::min (kMaxCorrectionSemitones, corr));
         }
         else
         {
-            if (++unvoicedCount_ >= 3)
+            voicedStreak_ = 0;
+            if (++unvoicedCount_ >= 5)          // ~20 ms sin voz
             {
                 voiced_ = false;
                 currentNote_ = -1;
@@ -416,7 +473,7 @@ private:
 
     double corrSmoothed_ = 0.0, corrTarget_ = 0.0, period_ = 220.0;
     bool voiced_ = false;
-    int unvoicedCount_ = 100, currentNote_ = -1, targetNote_ = -1;
+    int voicedStreak_ = 0, unvoicedCount_ = 100, currentNote_ = -1, targetNote_ = -1;
     float detectedHz_ = 0.0f;
 };
 
