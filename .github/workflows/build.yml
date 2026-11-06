@@ -1,0 +1,33 @@
+   name: Compilar VST3
+
+   on:
+     push:
+       branches: [ main, master ]
+     workflow_dispatch:
+
+   jobs:
+     build:
+       strategy:
+         fail-fast: false
+         matrix:
+           include:
+             - os: windows-latest
+               name: Windows
+             - os: macos-latest
+               name: macOS
+       runs-on: ${{ matrix.os }}
+       name: ${{ matrix.name }}
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: Configurar
+           run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+         - name: Compilar VST3
+           run: cmake --build build --config Release --target NeonTune_VST3 --parallel
+
+         - name: Subir plugin
+           uses: actions/upload-artifact@v4
+           with:
+             name: NeonTune-${{ matrix.name }}-VST3
+             path: build/NeonTune_artefacts/Release/VST3/
